@@ -1,0 +1,116 @@
+
+name: Windows GPU RDP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    # Must match the actual Larger Runner name/label
+    runs-on:
+      labels: windows-gpu-t4
+
+    timeout-minutes: 360
+
+    steps:
+      - name: Check Windows and NVIDIA GPU
+        shell: pwsh
+        run: |
+          Get-ComputerInfo |
+            Select-Object WindowsProductName, WindowsVersion
+          Get-CimInstance Win32_Processor |
+            Select-Object Name, NumberOfCores
+          Get-CimInstance Win32_OperatingSystem |
+            Select-Object TotalVisibleMemorySize
+          nvidia-smi
+
+      - name: Configure secure RDP
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Add RDP_PASSWORD to repository Actions secrets."
+          }
+
+          $password = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name "NvDAdmin" `
+              -ErrorAction SilentlyContinue)) {
+            New-LocalUser -Name "NvDAdmin" `
+              -Password $password `
+              -PasswordNeverExpires
+          } else {
+            Set-LocalUser -Name "NvDAdmin" `
+              -Password $password
+          }
+
+          Add-LocalGroupMember -Group "Administrators" `
+            -Member "NvDAdmin" -ErrorAction SilentlyContinue
+
+          Set-ItemProperty `
+            "HKLM:\System\CurrentControlSet\Control\Terminal Server" `
+            -Name fDenyTSConnections -Value 0
+
+          # Keep Network Level Authentication enabled
+          Set-ItemProperty `
+            "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" `
+            -Name UserAuthentication -Value 1
+
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          Get-NetFirewallRule -DisplayGroup "Remote Desktop" |
+            Set-NetFirewallRule -RemoteAddress "100.64.0.0/10"
+
+      - name: Install and connect Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+            throw "Add TAILSCALE_AUTHKEY to repository Actions secrets."
+          }
+
+          Invoke-WebRequest `
+            "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+            -OutFile "$env:TEMP\tailscale.msi"
+
+          $proc = Start-Process msiexec.exe `
+            -ArgumentList "/i `"$env:TEMP\tailscale.msi`" /quiet /norestart" `
+            -Wait -PassThru
+
+          if ($proc.ExitCode -notin @(0, 3010)) {
+            throw "Tailscale installation failed: $($proc.ExitCode)"
+          }
+
+          $ts = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $ts)) {
+            throw "Tailscale executable not found."
+          }
+
+          & $ts up "--authkey=$env:TAILSCALE_AUTHKEY" `
+            --hostname=github-rdp-server
+
+          Start-Sleep -Seconds 5
+          $tsIp = (& $ts ip -4 | Select-Object -First 1).Trim()
+
+          if (-not $tsIp) {
+            throw "Could not obtain a Tailscale IPv4 address."
+          }
+
+          Write-Host "Tailscale IP: $tsIp"
+          Write-Host "RDP username: NvDAdmin"
+          Write-Host "Connect using Windows Remote Desktop (mstsc)."
+
+      - name: Keep job alive
+        shell: pwsh
+        run: |
+          for ($i = 1; $i -le 350; $i++) {
+            Start-Sleep -Seconds 60
+            Write-Host "GPU runner active: minute $i"
+          }
